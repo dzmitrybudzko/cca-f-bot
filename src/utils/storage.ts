@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 import { Difficulty } from "../models/exam-question";
 
-const DATA_DIR = path.join(process.cwd(), "data");
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
 const PROGRESS_FILE = path.join(DATA_DIR, "progress.json");
 
 export interface StoredAnswerRecord {
