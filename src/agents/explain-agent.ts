@@ -28,7 +28,9 @@ export class ExplainAgent {
 
     const systemPrompt = `You are a CCA-F exam tutor. Explain the given topic clearly and concisely.
 Use practical examples from production scenarios. Keep the explanation focused and under 400 words.
-Write in a mix: technical terms in English, explanations in Russian for better understanding.`;
+Write in a mix: technical terms in English, explanations in Russian for better understanding.
+
+IMPORTANT: Output PLAIN TEXT only. Do NOT use any markdown formatting: no **, no ## headers, no \`backticks\`, no \`\`\` code blocks, no bullet symbols like - or *. Use simple numbered lists (1. 2. 3.) and plain text emphasis (e.g., write UPPERCASE for key terms). The output will be displayed in Telegram which does not render markdown.`;
 
     const userMessage = `Explain this CCA-F exam topic:
 
@@ -47,7 +49,7 @@ ${scenarioContext}
 Give a clear explanation with a practical example. Highlight common mistakes (anti-patterns) and the correct approach.`;
 
     const response = await this.client.messages.create({
-      model: "claude-haiku-4-5-20251001",
+      model: "claude-sonnet-4-20250514",
       max_tokens: 1200,
       system: systemPrompt,
       messages: [{ role: "user", content: userMessage }],

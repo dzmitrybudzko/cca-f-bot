@@ -126,6 +126,8 @@ ${antiPatternContext}
 DO NOT generate questions about these OUT-OF-SCOPE topics:
 ${outOfScopeContext}
 
+FORMATTING: All text fields (question_text, options, explanation) must be PLAIN TEXT only. No markdown: no **, no ## headers, no \`backticks\`, no \`\`\` code blocks. Use UPPERCASE for emphasis if needed.
+
 Use the submit_exam_question tool to return the question.`;
 }
 
@@ -161,7 +163,7 @@ export class CCAExamAgent {
             : `The previous attempt had validation errors: ${lastError?.message}. Please fix these issues and generate a valid question.`;
 
         const response = await this.client.messages.create({
-          model: "claude-haiku-4-5-20251001",
+          model: "claude-sonnet-4-20250514",
           max_tokens: 1500,
           system: systemPrompt,
           tools: [QUESTION_TOOL],
