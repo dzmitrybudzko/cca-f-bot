@@ -12,6 +12,7 @@ import {
   MockExamSimulator,
   MockExamResult,
 } from "../agents/mock-exam-simulator";
+import { ExplainAgent } from "../agents/explain-agent";
 import { ExamQuestion } from "../models/exam-question";
 import { DOMAINS } from "../domains/domain-definitions";
 import {
@@ -25,6 +26,12 @@ import {
   updateCurrentSession,
   getTimeSinceLastSession,
 } from "../utils/storage";
+import {
+  getCachedQuestion,
+  addToCache,
+  needsRefill,
+  getCacheSize,
+} from "../utils/question-cache";
 import { answerKeyboard, examStartKeyboard, domainKeyboard } from "./keyboards";
 
 interface ActiveQuestion {
@@ -42,6 +49,7 @@ const HOUR_MS = 60 * 60 * 1000;
 export function createBot(token: string, anthropicClient: Anthropic): Telegraf {
   const bot = new Telegraf(token);
   const examAgent = new CCAExamAgent(anthropicClient);
+  const explainAgent = new ExplainAgent(anthropicClient);
   const mockSimulator = new MockExamSimulator(examAgent, {
     totalQuestions: 10,
     difficulty: "medium",
@@ -49,6 +57,7 @@ export function createBot(token: string, anthropicClient: Anthropic): Telegraf {
 
   const activeQuestions = new Map<number, ActiveQuestion>();
   const examSessions = new Map<number, ExamSession>();
+  let cacheRefillInProgress = false;
 
   function getProgress(userId: number): StoredUserProgress {
     const stored = loadUserProgress(userId);
@@ -98,6 +107,7 @@ Commands:
 /practice — Get an adaptive practice question
 /domain — Choose a specific domain to practice
 /exam — Start a mini mock exam (10 questions)
+/explain — Explain a topic (e.g. /explain 1.3)
 /stats — View your performance statistics
 /recommend — Get study recommendations
 
@@ -112,6 +122,33 @@ Passing score: 720/1000. Let's aim for 1000!`
     );
   });
 
+  async function backgroundCacheRefill(domainId: number, difficulty: "easy" | "medium" | "hard") {
+    if (cacheRefillInProgress) return;
+    cacheRefillInProgress = true;
+    try {
+      const batch: ExamQuestion[] = [];
+      const domains = [1, 2, 3, 4, 5];
+      for (let i = 0; i < 5; i++) {
+        const d = domains[i];
+        const scenarioId = selectScenarioForDomain(d);
+        try {
+          const q = await examAgent.generateQuestion(d, scenarioId, difficulty);
+          batch.push(q);
+        } catch {
+          // skip failed generations
+        }
+      }
+      if (batch.length > 0) {
+        addToCache(batch);
+        console.log(`Cache refilled: +${batch.length} questions (total: ${getCacheSize()})`);
+      }
+    } catch (err) {
+      console.error("Cache refill error:", err);
+    } finally {
+      cacheRefillInProgress = false;
+    }
+  }
+
   bot.command("practice", async (ctx) => {
     const userId = ctx.from.id;
     const progress = getProgress(userId);
@@ -124,14 +161,30 @@ Passing score: 720/1000. Let's aim for 1000!`
     ensureActiveSession(progress);
     saveUserProgress(progress);
 
+    const domainId = selectNextDomain(progress);
+    const difficulty = calculateDifficulty(getOverallAccuracy(progress));
+    const excludeHashes = new Set(progress.history.map((h) => h.question_hash));
+
+    const cached = getCachedQuestion(domainId, difficulty, excludeHashes);
+    if (cached) {
+      const welcomeBack = formatSessionGap(progress);
+      const questionId = `q_${userId}_${Date.now()}`;
+      activeQuestions.set(userId, { question: cached });
+      const text = formatQuestion(cached);
+      await ctx.reply(`${welcomeBack}${text}`, { parse_mode: "HTML", ...answerKeyboard(questionId) });
+
+      if (needsRefill()) {
+        backgroundCacheRefill(domainId, difficulty);
+      }
+      return;
+    }
+
     const welcomeBack = formatSessionGap(progress);
     await ctx.reply(`${welcomeBack}Generating question...`);
 
     try {
-      const domainId = selectNextDomain(progress);
       const taskStatementId = selectTaskStatement(progress, domainId);
       const scenarioId = selectScenarioForDomain(domainId);
-      const difficulty = calculateDifficulty(getOverallAccuracy(progress));
 
       const question = await examAgent.generateQuestion(
         domainId,
@@ -154,6 +207,10 @@ Passing score: 720/1000. Let's aim for 1000!`
           const text = formatQuestion(question2);
           const questionId = `q_${userId}_${Date.now()}`;
           await ctx.reply(text, { parse_mode: "HTML", ...answerKeyboard(questionId) });
+
+          if (needsRefill()) {
+            backgroundCacheRefill(domainId, difficulty);
+          }
           return;
         }
       }
@@ -163,6 +220,10 @@ Passing score: 720/1000. Let's aim for 1000!`
 
       const text = formatQuestion(question);
       await ctx.reply(text, { parse_mode: "HTML", ...answerKeyboard(questionId) });
+
+      if (needsRefill()) {
+        backgroundCacheRefill(domainId, difficulty);
+      }
     } catch (error) {
       console.error("Question generation error:", error);
       await ctx.reply("Failed to generate a question. Please try again in a moment.");
@@ -373,6 +434,37 @@ Ready?`,
     text += `\nProjected score: ${projected}/1000 ${projected >= 720 ? "(PASS)" : "(need 720)"}`;
 
     await ctx.reply(text);
+  });
+
+  bot.command("explain", async (ctx) => {
+    const arg = ctx.message.text.split(/\s+/)[1];
+    if (!arg) {
+      await ctx.reply(
+        "Usage:\n  /explain 1.3 — explain task statement 1.3\n  /explain 2 — overview of domain 2\n\nDomains: 1-5, Task statements: 1.1-1.7, 2.1-2.5, 3.1-3.6, 4.1-4.6, 5.1-5.6"
+      );
+      return;
+    }
+
+    if (/^\d$/.test(arg)) {
+      const domainId = parseInt(arg);
+      const text = await explainAgent.explainDomain(domainId);
+      await ctx.reply(text);
+      return;
+    }
+
+    if (/^\d\.\d+$/.test(arg)) {
+      await ctx.reply("Generating explanation...");
+      try {
+        const text = await explainAgent.explain(arg);
+        await ctx.reply(text);
+      } catch (error) {
+        console.error("Explain error:", error);
+        await ctx.reply("Failed to generate explanation. Please try again.");
+      }
+      return;
+    }
+
+    await ctx.reply("Invalid format. Use: /explain 1.3 or /explain 2");
   });
 
   bot.command("recommend", async (ctx) => {

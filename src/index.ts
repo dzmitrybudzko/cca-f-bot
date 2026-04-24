@@ -20,8 +20,12 @@ if (!ANTHROPIC_API_KEY) {
 const anthropicClient = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 const bot = createBot(TELEGRAM_BOT_TOKEN, anthropicClient);
 
-bot.launch().then(() => {
+console.log("Starting bot...");
+bot.launch({ dropPendingUpdates: true }).then(() => {
   console.log("CCA-F Exam Bot is running");
+}).catch((err) => {
+  console.error("Bot launch failed:", err);
+  process.exit(1);
 });
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
