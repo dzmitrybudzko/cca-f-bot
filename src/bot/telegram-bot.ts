@@ -4,6 +4,7 @@ import { CCAExamAgent } from "../agents/exam-agent";
 import {
   calculateDifficulty,
   selectNextDomain,
+  selectTaskStatement,
   selectScenarioForDomain,
   generateRecommendation,
 } from "../agents/adaptive-agent";
@@ -11,25 +12,32 @@ import {
   MockExamSimulator,
   MockExamResult,
 } from "../agents/mock-exam-simulator";
-import {
-  UserProgress,
-  createUserProgress,
-  getOverallAccuracy,
-  getDomainAccuracy,
-} from "../models/user-progress";
 import { ExamQuestion } from "../models/exam-question";
 import { DOMAINS } from "../domains/domain-definitions";
+import {
+  StoredUserProgress,
+  loadUserProgress,
+  saveUserProgress,
+  createStoredUserProgress,
+  hashQuestion,
+  wasQuestionAsked,
+  ensureActiveSession,
+  updateCurrentSession,
+  getTimeSinceLastSession,
+} from "../utils/storage";
 import { answerKeyboard, examStartKeyboard, domainKeyboard } from "./keyboards";
 
 interface ActiveQuestion {
   question: ExamQuestion;
-  messageId?: number;
 }
 
 interface ExamSession {
   result: MockExamResult;
   currentIndex: number;
 }
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
 
 export function createBot(token: string, anthropicClient: Anthropic): Telegraf {
   const bot = new Telegraf(token);
@@ -39,22 +47,52 @@ export function createBot(token: string, anthropicClient: Anthropic): Telegraf {
     difficulty: "medium",
   });
 
-  const userProgress = new Map<number, UserProgress>();
   const activeQuestions = new Map<number, ActiveQuestion>();
   const examSessions = new Map<number, ExamSession>();
 
-  function getProgress(userId: number): UserProgress {
-    if (!userProgress.has(userId)) {
-      userProgress.set(userId, createUserProgress(userId));
+  function getProgress(userId: number): StoredUserProgress {
+    const stored = loadUserProgress(userId);
+    if (stored) return stored;
+    const fresh = createStoredUserProgress(userId);
+    saveUserProgress(fresh);
+    return fresh;
+  }
+
+  function getOverallAccuracy(progress: StoredUserProgress): number {
+    let correct = 0;
+    let total = 0;
+    for (const stats of Object.values(progress.domainStats)) {
+      correct += stats.correct;
+      total += stats.total;
     }
-    return userProgress.get(userId)!;
+    return total === 0 ? 0 : (correct / total) * 100;
+  }
+
+  function getDomainAccuracy(progress: StoredUserProgress, domainId: number): number {
+    const stats = progress.domainStats[String(domainId)];
+    if (!stats || stats.total === 0) return 0;
+    return (stats.correct / stats.total) * 100;
+  }
+
+  function formatSessionGap(progress: StoredUserProgress): string {
+    const gap = getTimeSinceLastSession(progress);
+    if (gap === null) return "";
+    const days = Math.floor(gap / DAY_MS);
+    const hours = Math.floor(gap / HOUR_MS);
+    if (days >= 1) return `Welcome back! Last session was ${days} day(s) ago.\n\n`;
+    if (hours >= 1) return `Welcome back! Last session was ${hours} hour(s) ago.\n\n`;
+    return "";
   }
 
   bot.command("start", async (ctx) => {
+    const progress = getProgress(ctx.from.id);
+    const welcomeBack = progress.history.length > 0 ? formatSessionGap(progress) : "";
+
     await ctx.reply(
-      `Welcome to CCA-F Exam Prep Bot!
+      `${welcomeBack}Welcome to CCA-F Exam Prep Bot!
 
 This bot helps you prepare for the Claude Certified Architect – Foundations exam.
+Your progress is saved between sessions.
 
 Commands:
 /practice — Get an adaptive practice question
@@ -83,32 +121,51 @@ Passing score: 720/1000. Let's aim for 1000!`
       return;
     }
 
-    await ctx.reply("Generating question...");
+    ensureActiveSession(progress);
+    saveUserProgress(progress);
+
+    const welcomeBack = formatSessionGap(progress);
+    await ctx.reply(`${welcomeBack}Generating question...`);
 
     try {
       const domainId = selectNextDomain(progress);
+      const taskStatementId = selectTaskStatement(progress, domainId);
       const scenarioId = selectScenarioForDomain(domainId);
       const difficulty = calculateDifficulty(getOverallAccuracy(progress));
 
       const question = await examAgent.generateQuestion(
         domainId,
         scenarioId,
-        difficulty
+        difficulty,
+        taskStatementId
       );
+
+      const qHash = hashQuestion(question.question_text, question.options);
+      if (wasQuestionAsked(progress, qHash)) {
+        const question2 = await examAgent.generateQuestion(
+          domainId,
+          scenarioId,
+          difficulty,
+          taskStatementId
+        );
+        const qHash2 = hashQuestion(question2.question_text, question2.options);
+        if (!wasQuestionAsked(progress, qHash2)) {
+          activeQuestions.set(userId, { question: question2 });
+          const text = formatQuestion(question2);
+          const questionId = `q_${userId}_${Date.now()}`;
+          await ctx.reply(text, { parse_mode: "HTML", ...answerKeyboard(questionId) });
+          return;
+        }
+      }
 
       const questionId = `q_${userId}_${Date.now()}`;
       activeQuestions.set(userId, { question });
 
-      const text = formatQuestion(question, questionId);
-      await ctx.reply(text, {
-        parse_mode: "HTML",
-        ...answerKeyboard(questionId),
-      });
+      const text = formatQuestion(question);
+      await ctx.reply(text, { parse_mode: "HTML", ...answerKeyboard(questionId) });
     } catch (error) {
       console.error("Question generation error:", error);
-      await ctx.reply(
-        "Failed to generate a question. Please try again in a moment."
-      );
+      await ctx.reply("Failed to generate a question. Please try again in a moment.");
     }
   });
 
@@ -130,27 +187,30 @@ Passing score: 720/1000. Let's aim for 1000!`
     }
 
     await ctx.answerCbQuery();
+
+    const progress = getProgress(userId);
+    ensureActiveSession(progress);
+    saveUserProgress(progress);
+
     await ctx.reply("Generating question...");
 
     try {
-      const progress = getProgress(userId);
+      const taskStatementId = selectTaskStatement(progress, domainId);
       const scenarioId = selectScenarioForDomain(domainId);
       const difficulty = calculateDifficulty(getDomainAccuracy(progress, domainId));
 
       const question = await examAgent.generateQuestion(
         domainId,
         scenarioId,
-        difficulty
+        difficulty,
+        taskStatementId
       );
 
       const questionId = `q_${userId}_${Date.now()}`;
       activeQuestions.set(userId, { question });
 
-      const text = formatQuestion(question, questionId);
-      await ctx.reply(text, {
-        parse_mode: "HTML",
-        ...answerKeyboard(questionId),
-      });
+      const text = formatQuestion(question);
+      await ctx.reply(text, { parse_mode: "HTML", ...answerKeyboard(questionId) });
     } catch (error) {
       console.error("Question generation error:", error);
       await ctx.reply("Failed to generate a question. Please try again.");
@@ -234,9 +294,11 @@ Ready?`,
     const isCorrect = answerIndex === question.correct_index;
     const progress = getProgress(userId);
 
-    const stats = progress.domainStats.get(question.domain_id)!;
+    const stats = progress.domainStats[String(question.domain_id)];
     stats.total++;
     if (isCorrect) stats.correct++;
+
+    const qHash = hashQuestion(question.question_text, question.options);
 
     progress.history.push({
       domain_id: question.domain_id,
@@ -245,11 +307,12 @@ Ready?`,
       correct: isCorrect,
       difficulty: question.difficulty,
       timestamp: Date.now(),
+      question_hash: qHash,
     });
 
-    progress.currentDifficulty = calculateDifficulty(
-      getOverallAccuracy(progress)
-    );
+    progress.currentDifficulty = calculateDifficulty(getOverallAccuracy(progress));
+    updateCurrentSession(progress);
+    saveUserProgress(progress);
 
     activeQuestions.delete(userId);
 
@@ -263,6 +326,7 @@ Ready?`,
     if (!isCorrect) response += `Correct answer: ${correctAnswer}\n`;
     response += `\n${question.explanation}`;
     response += `\n\nKey concept: ${question.key_concept}`;
+    response += `\nTask: ${question.task_statement_id} | D${question.domain_id}`;
 
     await ctx.reply(response);
   });
@@ -274,27 +338,36 @@ Ready?`,
     const totalAnswered = progress.history.length;
 
     if (totalAnswered === 0) {
-      await ctx.reply(
-        "No practice history yet. Use /practice to get started!"
-      );
+      await ctx.reply("No practice history yet. Use /practice to get started!");
       return;
     }
 
-    let text = `Your Statistics\n\n`;
+    const gap = getTimeSinceLastSession(progress);
+    let text = "Your Statistics\n\n";
+
+    if (gap !== null) {
+      const days = Math.floor(gap / DAY_MS);
+      if (days >= 1) text += `Last active: ${days} day(s) ago\n`;
+    }
+
     text += `Total questions: ${totalAnswered}\n`;
+    text += `Sessions: ${progress.sessions.length}\n`;
     text += `Overall accuracy: ${overall.toFixed(0)}%\n`;
     text += `Current difficulty: ${progress.currentDifficulty}\n\n`;
-    text += `Domain Breakdown:\n`;
+    text += "Domain Breakdown:\n";
 
     for (const domain of DOMAINS) {
-      const stats = progress.domainStats.get(domain.id)!;
-      const acc =
-        stats.total === 0
-          ? "—"
-          : `${((stats.correct / stats.total) * 100).toFixed(0)}%`;
+      const stats = progress.domainStats[String(domain.id)];
+      const acc = stats.total === 0
+        ? "—"
+        : `${((stats.correct / stats.total) * 100).toFixed(0)}%`;
       const bar = stats.total === 0 ? " " : getDomainAccuracy(progress, domain.id) >= 72 ? "+" : "-";
       text += `  [${bar}] D${domain.id}: ${stats.correct}/${stats.total} (${acc})\n`;
     }
+
+    // Task statement coverage
+    const coveredTs = new Set(progress.history.map((h) => h.task_statement_id));
+    text += `\nTask coverage: ${coveredTs.size}/29`;
 
     const projected = Math.round(100 + (overall / 100) * 900);
     text += `\nProjected score: ${projected}/1000 ${projected >= 720 ? "(PASS)" : "(need 720)"}`;
@@ -351,9 +424,11 @@ Ready?`,
       for (let i = 0; i < session.result.questions.length; i++) {
         const q = session.result.questions[i];
         const answered = session.result.answers[i];
-        const stats = progress.domainStats.get(q.domain_id)!;
+        const stats = progress.domainStats[String(q.domain_id)];
         stats.total++;
         if (answered === q.correct_index) stats.correct++;
+
+        const qHash = hashQuestion(q.question_text, q.options);
         progress.history.push({
           domain_id: q.domain_id,
           scenario_id: q.scenario_id,
@@ -361,9 +436,12 @@ Ready?`,
           correct: answered === q.correct_index,
           difficulty: q.difficulty,
           timestamp: Date.now(),
+          question_hash: qHash,
         });
       }
       progress.currentDifficulty = calculateDifficulty(getOverallAccuracy(progress));
+      updateCurrentSession(progress);
+      saveUserProgress(progress);
 
       examSessions.delete(userId);
     } else {
@@ -399,7 +477,7 @@ Ready?`,
   return bot;
 }
 
-function formatQuestion(question: ExamQuestion, _questionId: string): string {
+function formatQuestion(question: ExamQuestion): string {
   const domain = DOMAINS.find((d) => d.id === question.domain_id);
   let text = `<b>Practice Question</b>\n`;
   text += `D${question.domain_id}: ${domain?.name || "Unknown"} | ${question.difficulty}\n\n`;
