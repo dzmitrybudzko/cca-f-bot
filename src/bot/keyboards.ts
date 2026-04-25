@@ -33,3 +33,18 @@ export function domainKeyboard() {
     [Markup.button.callback("D5: Context/Reliability", "domain:5")],
   ]);
 }
+
+export function flashcardShowKeyboard(cardId: string) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("Show Answer", `fc_show:${cardId}`)],
+  ]);
+}
+
+export function flashcardRateKeyboard(cardId: string) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("Know it", `fc_ok:${cardId}`),
+      Markup.button.callback("Don't know", `fc_fail:${cardId}`),
+    ],
+  ]);
+}

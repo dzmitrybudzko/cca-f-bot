@@ -32,7 +32,16 @@ import {
   needsRefill,
   getCacheSize,
 } from "../utils/question-cache";
-import { answerKeyboard, examStartKeyboard, domainKeyboard } from "./keyboards";
+import { answerKeyboard, examStartKeyboard, domainKeyboard, flashcardShowKeyboard, flashcardRateKeyboard } from "./keyboards";
+import { getFlashcardById, FLASHCARDS } from "../flashcards/flashcard-data";
+import {
+  loadFlashcardState,
+  saveFlashcardState,
+  getNextCard,
+  markCorrect,
+  markIncorrect,
+  getFlashcardStats,
+} from "../flashcards/flashcard-storage";
 
 interface ActiveQuestion {
   question: ExamQuestion;
@@ -136,6 +145,7 @@ Your progress is saved between sessions.
 
 Commands:
 /practice — Get an adaptive practice question
+/flash — Flashcard with spaced repetition
 /domain — Choose a specific domain to practice
 /exam — Start a mini mock exam (10 questions)
 /explain — Explain a topic (e.g. /explain 1.3)
@@ -433,6 +443,82 @@ Ready?`,
     }
   });
 
+  bot.command("flash", async (ctx) => {
+    try {
+      const userId = ctx.from.id;
+      const state = loadFlashcardState(userId);
+      const cardId = getNextCard(state);
+
+      if (!cardId) {
+        const stats = getFlashcardStats(state);
+        await ctx.reply(
+          `All cards reviewed! ${stats.mastered}/${stats.total} mastered.\nCards will become due again based on spaced repetition intervals.`
+        );
+        return;
+      }
+
+      const card = getFlashcardById(cardId);
+      if (!card) {
+        await ctx.reply("Card not found. Try again.");
+        return;
+      }
+
+      const stats = getFlashcardStats(state);
+      const box = state.cards[cardId]?.box || 1;
+
+      let text = `<b>Flashcard</b> (${stats.dueNow} due | ${stats.mastered}/${stats.total} mastered)\n`;
+      text += `D${card.domain_id} | ${card.task_statement_id} | Box ${box}/5\n\n`;
+      text += escapeHtml(card.front);
+
+      await safeSend(ctx, text, { parse_mode: "HTML", ...flashcardShowKeyboard(cardId) });
+    } catch (error) {
+      console.error("Flash error:", error);
+      await ctx.reply("Failed to load flashcard. Please try again.");
+    }
+  });
+
+  bot.action(/^fc_show:(.+)$/, async (ctx) => {
+    const cardId = ctx.match[1];
+    await ctx.answerCbQuery();
+    await ctx.editMessageReplyMarkup(undefined);
+
+    const card = getFlashcardById(cardId);
+    if (!card) {
+      await ctx.reply("Card expired. Use /flash for a new one.");
+      return;
+    }
+
+    let text = `<b>Answer:</b>\n\n${escapeHtml(card.back)}`;
+    await safeSend(ctx, text, { parse_mode: "HTML", ...flashcardRateKeyboard(cardId) });
+  });
+
+  bot.action(/^fc_ok:(.+)$/, async (ctx) => {
+    const cardId = ctx.match[1];
+    const userId = ctx.from!.id;
+    await ctx.answerCbQuery("Correct!");
+    await ctx.editMessageReplyMarkup(undefined);
+
+    const state = loadFlashcardState(userId);
+    markCorrect(state, cardId);
+    saveFlashcardState(state);
+
+    const box = state.cards[cardId]?.box || 1;
+    await ctx.reply(`Moved to box ${box}/5. Use /flash for the next card.`);
+  });
+
+  bot.action(/^fc_fail:(.+)$/, async (ctx) => {
+    const cardId = ctx.match[1];
+    const userId = ctx.from!.id;
+    await ctx.answerCbQuery("Back to box 1");
+    await ctx.editMessageReplyMarkup(undefined);
+
+    const state = loadFlashcardState(userId);
+    markIncorrect(state, cardId);
+    saveFlashcardState(state);
+
+    await ctx.reply("Moved back to box 1. Use /flash for the next card.");
+  });
+
   bot.command("stats", async (ctx) => {
     const userId = ctx.from.id;
     const progress = getProgress(userId);
@@ -473,6 +559,12 @@ Ready?`,
 
     const projected = Math.round(100 + (overall / 100) * 900);
     text += `\nProjected score: ${projected}/1000 ${projected >= 720 ? "(PASS)" : "(need 720)"}`;
+
+    const fcState = loadFlashcardState(userId);
+    const fcStats = getFlashcardStats(fcState);
+    if (fcState.totalReviews > 0) {
+      text += `\n\nFlashcards: ${fcStats.mastered}/${fcStats.total} mastered, ${fcStats.dueNow} due`;
+    }
 
     await ctx.reply(text);
   });
