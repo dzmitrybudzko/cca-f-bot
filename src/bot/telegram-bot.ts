@@ -45,6 +45,32 @@ interface ExamSession {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
+const TG_MSG_LIMIT = 4096;
+
+async function safeSend(ctx: Context, text: string, options?: Record<string, unknown>): Promise<void> {
+  if (text.length <= TG_MSG_LIMIT) {
+    await ctx.reply(text, options as any);
+    return;
+  }
+  const parseMode = (options as any)?.parse_mode;
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= TG_MSG_LIMIT) {
+      chunks.push(remaining);
+      break;
+    }
+    let splitAt = remaining.lastIndexOf("\n", TG_MSG_LIMIT);
+    if (splitAt < TG_MSG_LIMIT / 2) splitAt = TG_MSG_LIMIT;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt);
+  }
+  for (let i = 0; i < chunks.length; i++) {
+    const isLast = i === chunks.length - 1;
+    const opts = isLast ? options : (parseMode ? { parse_mode: parseMode } : undefined);
+    await ctx.reply(chunks[i], opts as any);
+  }
+}
 
 export function createBot(token: string, anthropicClient: Anthropic): Telegraf {
   const bot = new Telegraf(token);
@@ -58,6 +84,11 @@ export function createBot(token: string, anthropicClient: Anthropic): Telegraf {
   const activeQuestions = new Map<number, ActiveQuestion>();
   const examSessions = new Map<number, ExamSession>();
   let cacheRefillInProgress = false;
+
+  bot.catch((err: unknown, ctx: Context) => {
+    console.error("Bot error:", err);
+    ctx.reply("An error occurred. Please try again.").catch(() => {});
+  });
 
   function getProgress(userId: number): StoredUserProgress {
     const stored = loadUserProgress(userId);
@@ -167,11 +198,16 @@ Passing score: 720/1000. Let's aim for 1000!`
 
     const cached = getCachedQuestion(domainId, difficulty, excludeHashes);
     if (cached) {
-      const welcomeBack = formatSessionGap(progress);
-      const questionId = `q_${userId}_${Date.now()}`;
-      activeQuestions.set(userId, { question: cached });
-      const text = formatQuestion(cached);
-      await ctx.reply(`${welcomeBack}${text}`, { parse_mode: "HTML", ...answerKeyboard(questionId) });
+      try {
+        const welcomeBack = formatSessionGap(progress);
+        const questionId = `q_${userId}_${Date.now()}`;
+        activeQuestions.set(userId, { question: cached });
+        const text = formatQuestion(cached);
+        await safeSend(ctx, `${welcomeBack}${text}`, { parse_mode: "HTML", ...answerKeyboard(questionId) });
+      } catch (error) {
+        console.error("Cached question send error:", error);
+        await ctx.reply("Failed to display question. Please try again.");
+      }
 
       if (needsRefill()) {
         backgroundCacheRefill(domainId, difficulty);
@@ -206,7 +242,7 @@ Passing score: 720/1000. Let's aim for 1000!`
           activeQuestions.set(userId, { question: question2 });
           const text = formatQuestion(question2);
           const questionId = `q_${userId}_${Date.now()}`;
-          await ctx.reply(text, { parse_mode: "HTML", ...answerKeyboard(questionId) });
+          await safeSend(ctx, text, { parse_mode: "HTML", ...answerKeyboard(questionId) });
 
           if (needsRefill()) {
             backgroundCacheRefill(domainId, difficulty);
@@ -219,7 +255,7 @@ Passing score: 720/1000. Let's aim for 1000!`
       activeQuestions.set(userId, { question });
 
       const text = formatQuestion(question);
-      await ctx.reply(text, { parse_mode: "HTML", ...answerKeyboard(questionId) });
+      await safeSend(ctx, text, { parse_mode: "HTML", ...answerKeyboard(questionId) });
 
       if (needsRefill()) {
         backgroundCacheRefill(domainId, difficulty);
@@ -271,7 +307,7 @@ Passing score: 720/1000. Let's aim for 1000!`
       activeQuestions.set(userId, { question });
 
       const text = formatQuestion(question);
-      await ctx.reply(text, { parse_mode: "HTML", ...answerKeyboard(questionId) });
+      await safeSend(ctx, text, { parse_mode: "HTML", ...answerKeyboard(questionId) });
     } catch (error) {
       console.error("Question generation error:", error);
       await ctx.reply("Failed to generate a question. Please try again.");
@@ -338,58 +374,63 @@ Ready?`,
     await ctx.answerCbQuery();
     await ctx.editMessageReplyMarkup(undefined);
 
-    const examSession = examSessions.get(userId);
+    try {
+      const examSession = examSessions.get(userId);
 
-    if (examSession) {
-      await handleExamAnswer(ctx, userId, examSession, answerIndex);
-      return;
+      if (examSession) {
+        await handleExamAnswer(ctx, userId, examSession, answerIndex);
+        return;
+      }
+
+      const active = activeQuestions.get(userId);
+      if (!active) {
+        await ctx.reply("This question has expired. Use /practice for a new one.");
+        return;
+      }
+
+      const question = active.question;
+      const isCorrect = answerIndex === question.correct_index;
+      const progress = getProgress(userId);
+
+      const stats = progress.domainStats[String(question.domain_id)];
+      stats.total++;
+      if (isCorrect) stats.correct++;
+
+      const qHash = hashQuestion(question.question_text, question.options);
+
+      progress.history.push({
+        domain_id: question.domain_id,
+        scenario_id: question.scenario_id,
+        task_statement_id: question.task_statement_id,
+        correct: isCorrect,
+        difficulty: question.difficulty,
+        timestamp: Date.now(),
+        question_hash: qHash,
+      });
+
+      progress.currentDifficulty = calculateDifficulty(getOverallAccuracy(progress));
+      updateCurrentSession(progress);
+      saveUserProgress(progress);
+
+      activeQuestions.delete(userId);
+
+      const labels = ["A", "B", "C", "D"];
+      const emoji = isCorrect ? "+" : "x";
+      const yourAnswer = labels[answerIndex];
+      const correctAnswer = labels[question.correct_index];
+
+      let response = `[${emoji}] ${isCorrect ? "Correct!" : "Incorrect."}\n`;
+      response += `Your answer: ${yourAnswer}\n`;
+      if (!isCorrect) response += `Correct answer: ${correctAnswer}\n`;
+      response += `\n${question.explanation}`;
+      response += `\n\nKey concept: ${question.key_concept}`;
+      response += `\nTask: ${question.task_statement_id} | D${question.domain_id}`;
+
+      await safeSend(ctx, response);
+    } catch (error) {
+      console.error("Answer handler error:", error);
+      await ctx.reply("Error processing answer. Please try /practice for a new question.");
     }
-
-    const active = activeQuestions.get(userId);
-    if (!active) {
-      await ctx.reply("This question has expired. Use /practice for a new one.");
-      return;
-    }
-
-    const question = active.question;
-    const isCorrect = answerIndex === question.correct_index;
-    const progress = getProgress(userId);
-
-    const stats = progress.domainStats[String(question.domain_id)];
-    stats.total++;
-    if (isCorrect) stats.correct++;
-
-    const qHash = hashQuestion(question.question_text, question.options);
-
-    progress.history.push({
-      domain_id: question.domain_id,
-      scenario_id: question.scenario_id,
-      task_statement_id: question.task_statement_id,
-      correct: isCorrect,
-      difficulty: question.difficulty,
-      timestamp: Date.now(),
-      question_hash: qHash,
-    });
-
-    progress.currentDifficulty = calculateDifficulty(getOverallAccuracy(progress));
-    updateCurrentSession(progress);
-    saveUserProgress(progress);
-
-    activeQuestions.delete(userId);
-
-    const labels = ["A", "B", "C", "D"];
-    const emoji = isCorrect ? "+" : "x";
-    const yourAnswer = labels[answerIndex];
-    const correctAnswer = labels[question.correct_index];
-
-    let response = `[${emoji}] ${isCorrect ? "Correct!" : "Incorrect."}\n`;
-    response += `Your answer: ${yourAnswer}\n`;
-    if (!isCorrect) response += `Correct answer: ${correctAnswer}\n`;
-    response += `\n${question.explanation}`;
-    response += `\n\nKey concept: ${question.key_concept}`;
-    response += `\nTask: ${question.task_statement_id} | D${question.domain_id}`;
-
-    await ctx.reply(response);
   });
 
   bot.command("stats", async (ctx) => {
@@ -448,7 +489,7 @@ Ready?`,
     if (/^\d$/.test(arg)) {
       const domainId = parseInt(arg);
       const text = await explainAgent.explainDomain(domainId);
-      await ctx.reply(text);
+      await safeSend(ctx, text);
       return;
     }
 
@@ -456,7 +497,7 @@ Ready?`,
       await ctx.reply("Generating explanation...");
       try {
         const text = await explainAgent.explain(arg);
-        await ctx.reply(text);
+        await safeSend(ctx, text);
       } catch (error) {
         console.error("Explain error:", error);
         await ctx.reply("Failed to generate explanation. Please try again.");
@@ -468,18 +509,23 @@ Ready?`,
   });
 
   bot.command("recommend", async (ctx) => {
-    const userId = ctx.from.id;
-    const progress = getProgress(userId);
+    try {
+      const userId = ctx.from.id;
+      const progress = getProgress(userId);
 
-    if (progress.history.length === 0) {
-      await ctx.reply(
-        "No practice history yet. Use /practice to get started, then I can give recommendations!"
-      );
-      return;
+      if (progress.history.length === 0) {
+        await ctx.reply(
+          "No practice history yet. Use /practice to get started, then I can give recommendations!"
+        );
+        return;
+      }
+
+      const rec = generateRecommendation(progress);
+      await safeSend(ctx, `Study Recommendations\n\n${rec.summary}`);
+    } catch (error) {
+      console.error("Recommend error:", error);
+      await ctx.reply("Failed to generate recommendations. Please try again.");
     }
-
-    const rec = generateRecommendation(progress);
-    await ctx.reply(`Study Recommendations\n\n${rec.summary}`);
   });
 
   async function handleExamAnswer(
@@ -510,7 +556,7 @@ Ready?`,
     if (session.currentIndex >= session.result.questions.length) {
       MockExamSimulator.finalize(session.result);
       const resultText = MockExamSimulator.formatResults(session.result);
-      await ctx.reply(resultText);
+      await safeSend(ctx, resultText);
 
       const progress = getProgress(userId);
       for (let i = 0; i < session.result.questions.length; i++) {
@@ -560,7 +606,7 @@ Ready?`,
       text += `<b>${labels[i]}.</b> ${escapeHtml(question.options[i])}\n\n`;
     }
 
-    await ctx.reply(text, {
+    await safeSend(ctx, text, {
       parse_mode: "HTML",
       ...answerKeyboard(questionId),
     });
