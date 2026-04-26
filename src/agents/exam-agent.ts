@@ -5,6 +5,7 @@ import { getScenarioById } from "../domains/scenarios";
 import { ANTI_PATTERNS } from "../anti-patterns/seven-patterns";
 import { OUT_OF_SCOPE_TOPICS } from "../knowledge-base/cca-knowledge";
 import { validateExamQuestion } from "../utils/validation";
+import { ReviewAgent } from "./review-agent";
 
 function shuffleOptions(
   options: [string, string, string, string],
@@ -149,10 +150,12 @@ Use the submit_exam_question tool to return the question.`;
 
 export class CCAExamAgent {
   private client: Anthropic;
+  private reviewer: ReviewAgent;
   private maxRetries: number;
 
   constructor(client: Anthropic, maxRetries = 2) {
     this.client = client;
+    this.reviewer = new ReviewAgent(client);
     this.maxRetries = maxRetries;
   }
 
@@ -225,6 +228,27 @@ export class CCAExamAgent {
         const errors = validateExamQuestion(question);
         if (errors.length > 0) {
           throw new Error(errors.join("; "));
+        }
+
+        try {
+          const review = await this.reviewer.review(question);
+          if (!review.approved) {
+            console.log(`Review rejected (attempt ${attempt}): ${review.issues.join("; ")}`);
+            if (review.correctedCorrectIndex >= 0 && review.correctedCorrectIndex <= 3) {
+              question.correct_index = review.correctedCorrectIndex as 0 | 1 | 2 | 3;
+              console.log(`Correct answer updated to index ${review.correctedCorrectIndex}`);
+              return question;
+            }
+            throw new Error(`Review rejected: ${review.issues.join("; ")}`);
+          }
+          if (review.correctedCorrectIndex >= 0 && review.correctedCorrectIndex <= 3) {
+            question.correct_index = review.correctedCorrectIndex as 0 | 1 | 2 | 3;
+          }
+        } catch (reviewError) {
+          if (reviewError instanceof Error && reviewError.message.startsWith("Review rejected:")) {
+            throw reviewError;
+          }
+          console.error("Review agent error (skipping review):", reviewError);
         }
 
         return question;
