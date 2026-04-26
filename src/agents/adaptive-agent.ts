@@ -12,8 +12,8 @@ const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
 export function calculateDifficulty(userAccuracy: number): Difficulty {
-  if (userAccuracy < 60) return "easy";
-  if (userAccuracy < 75) return "medium";
+  if (userAccuracy < 45) return "easy";
+  if (userAccuracy < 60) return "medium";
   return "hard";
 }
 

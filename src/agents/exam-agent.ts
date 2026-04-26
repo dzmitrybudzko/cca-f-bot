@@ -6,6 +6,21 @@ import { ANTI_PATTERNS } from "../anti-patterns/seven-patterns";
 import { OUT_OF_SCOPE_TOPICS } from "../knowledge-base/cca-knowledge";
 import { validateExamQuestion } from "../utils/validation";
 
+function shuffleOptions(
+  options: [string, string, string, string],
+  correctIndex: number
+): { options: [string, string, string, string]; correct_index: 0 | 1 | 2 | 3 } {
+  const correctAnswer = options[correctIndex];
+  const indices = [0, 1, 2, 3];
+  for (let i = indices.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [indices[i], indices[j]] = [indices[j], indices[i]];
+  }
+  const shuffled = indices.map((i) => options[i]) as [string, string, string, string];
+  const newCorrectIndex = shuffled.indexOf(correctAnswer) as 0 | 1 | 2 | 3;
+  return { options: shuffled, correct_index: newCorrectIndex };
+}
+
 const QUESTION_TOOL = {
   name: "submit_exam_question",
   description:
@@ -113,12 +128,13 @@ MANDATORY RULES:
 2. Question MUST test Domain ${domain.id}: ${domain.name}
 ${taskContext}
 3. Difficulty level: ${difficulty}
-   - easy: Tests direct recall of concepts and straightforward application
-   - medium: Requires analysis of a production scenario and choosing the best approach among plausible options
-   - hard: Requires deep understanding of tradeoffs, edge cases, and subtle distinctions between valid approaches
-4. Distractors must be REAL architectural anti-patterns or common mistakes, not obviously wrong answers
+   - easy: Tests direct recall with a realistic scenario. Still requires choosing among plausible options.
+   - medium: Requires analyzing tradeoffs in a production scenario. All options should sound reasonable to someone who hasn't studied.
+   - hard: Tests subtle distinctions — two or more options are partially correct, only one is the BEST approach. Requires deep understanding of edge cases and architectural tradeoffs.
+4. Distractors must be REAL architectural anti-patterns or common mistakes, not obviously wrong answers. At least 2 distractors should be plausible to a less-prepared candidate.
 5. Include precise terminology from the official exam guide (stop_reason, CLAUDE.md, tool_choice, etc.)
 6. The explanation MUST explain why the correct answer is right AND why each distractor fails
+7. Keep questions CONCISE: question text should be 2-4 sentences max. Options should be 1-2 sentences each. No filler or repetition. Match real CCA-F exam style.
 
 ANTI-PATTERNS TO USE IN DISTRACTORS (where appropriate):
 ${antiPatternContext}
@@ -180,10 +196,15 @@ export class CCAExamAgent {
 
         const input = toolUseBlock.input as Record<string, unknown>;
 
+        const rawOptions = input.options as [string, string, string, string];
+        const rawCorrect = input.correct_index as number;
+        const { options: shuffledOptions, correct_index: shuffledCorrect } =
+          shuffleOptions(rawOptions, rawCorrect);
+
         const question: ExamQuestion = {
           question_text: input.question_text as string,
-          options: input.options as [string, string, string, string],
-          correct_index: input.correct_index as 0 | 1 | 2 | 3,
+          options: shuffledOptions,
+          correct_index: shuffledCorrect,
           explanation: input.explanation as string,
           key_concept: input.key_concept as string,
           domain_id: domainId as 1 | 2 | 3 | 4 | 5,

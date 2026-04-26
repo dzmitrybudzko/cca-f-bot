@@ -36,18 +36,18 @@ function progressWithHistory(records: Array<{
 }
 
 describe("calculateDifficulty", () => {
-  it("returns easy for accuracy below 60%", () => {
+  it("returns easy for accuracy below 45%", () => {
     expect(calculateDifficulty(0)).toBe("easy");
-    expect(calculateDifficulty(59)).toBe("easy");
+    expect(calculateDifficulty(44)).toBe("easy");
   });
 
-  it("returns medium for accuracy 60-74%", () => {
-    expect(calculateDifficulty(60)).toBe("medium");
-    expect(calculateDifficulty(74)).toBe("medium");
+  it("returns medium for accuracy 45-59%", () => {
+    expect(calculateDifficulty(45)).toBe("medium");
+    expect(calculateDifficulty(59)).toBe("medium");
   });
 
-  it("returns hard for accuracy 75%+", () => {
-    expect(calculateDifficulty(75)).toBe("hard");
+  it("returns hard for accuracy 60%+", () => {
+    expect(calculateDifficulty(60)).toBe("hard");
     expect(calculateDifficulty(100)).toBe("hard");
   });
 });
